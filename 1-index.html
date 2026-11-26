@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Depth Maker</title>
+<style>
+  :root{--bg:#0e0f13;--card:#171922;--line:#262a37;--tx:#eef0f6;--mut:#8b91a5;--ac:#7c8cff}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  main{max-width:1100px;margin:0 auto;padding:20px 16px 60px}
+  h1{font-size:26px;margin:6px 0 2px}
+  .sub{color:var(--mut);margin:0 0 18px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  button,.btn,select{background:var(--card);color:var(--tx);border:1px solid var(--line);border-radius:12px;padding:11px 16px;font:inherit;cursor:pointer;transition:background .2s,transform .15s,border-color .2s;outline:none}
+  button:hover,.btn:hover{border-color:var(--ac)}
+  button:active,.btn:active{transform:scale(.97)}
+  button.primary{background:var(--ac);border-color:var(--ac);color:#0b0c12;font-weight:600}
+  button:disabled{opacity:.4;cursor:default}
+  input[type=file]{display:none}
+  .stage{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media(max-width:700px){.stage{grid-template-columns:1fr}}
+  .pane{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;position:relative}
+  .pane canvas{display:block;width:100%;height:auto;background:#000}
+  .tag{position:absolute;left:10px;top:10px;background:#000a;padding:3px 10px;border-radius:99px;font-size:13px}
+  [hidden]{display:none!important}
+  .empty{aspect-ratio:16/9;display:grid;place-items:center;color:var(--mut);text-align:center;padding:20px}
+  .fx{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}
+  .fx button.on{background:var(--ac);border-color:var(--ac);color:#0b0c12;font-weight:600}
+  .opts{display:flex;gap:18px;flex-wrap:wrap;align-items:center;color:var(--mut);font-size:14px;min-height:36px}
+  .opts label{display:flex;gap:8px;align-items:center}
+  input[type=range]{accent-color:var(--ac)}
+  #status{color:var(--mut);font-size:14px;margin:10px 0;min-height:20px}
+  .bar{height:6px;background:var(--line);border-radius:9px;overflow:hidden;margin:8px 0;display:none}
+  .bar i{display:block;height:100%;width:0;background:var(--ac);transition:width .2s}
+  .hint{color:var(--mut);font-size:13px}
+</style>
+</head>
+<body>
+<main>
+  <h1>Depth Maker</h1>
+  <p class="sub">Turn any video into a depth map. Runs in your browser. Nothing is uploaded.</p>
+
+  <div class="row">
+    <label class="btn primary" for="file">Upload a video</label>
+    <input id="file" type="file" accept="video/*">
+    <button id="cam">Use camera</button>
+    <button id="stop" disabled>Stop</button>
+    <select id="quality" title="Quality">
+      <option value="320">Fast</option>
+      <option value="448" selected>Balanced</option>
+      <option value="640">Sharp</option>
+    </select>
+  </div>
+
+  <div class="bar" id="bar"><i id="barfill"></i></div>
+  <div id="status">Loading the depth model on first use (about 30 MB, then cached).</div>
+
+  <div class="stage">
+    <div class="pane"><span class="tag">Original</span><div class="empty" id="empty1">Pick a video or turn on the camera</div><canvas id="orig" hidden></canvas></div>
+    <div class="pane"><span class="tag" id="fxtag">Depth</span><div class="empty" id="empty2">The result shows here</div><canvas id="out" hidden></canvas></div>
+  </div>
+
+  <div class="fx" id="fx"></div>
+  <div class="opts" id="opts"></div>
+
+  <div class="row" style="margin-top:16px">
+    <button id="dlpng" disabled>Download image</button>
+    <button id="dlvid" disabled>Download video</button>
+    <span class="hint" id="vidhint">Video export uses the effect and settings you pick, for an uploaded video.</span>
+  </div>
+</main>
+
+<script type="module">
+import { pipeline, RawImage, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6';
+let Muxer, ArrayBufferTarget;
+try { ({ Muxer, ArrayBufferTarget } = await import('https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/+esm')); } catch(e) {}
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status'), bar = $('bar'), barfill = $('barfill');
+const say = t => statusEl.textContent = t;
+
+// ---------- color ramps ----------
+const RAMPS = {
+  Turbo: [[48,18,59],[70,107,227],[40,187,236],[49,241,152],[164,252,60],[237,208,58],[251,128,34],[200,41,3],[122,4,3]],
+  Inferno: [[0,0,4],[40,11,84],[101,21,110],[159,42,99],[212,72,66],[245,125,21],[250,193,39],[252,255,164]],
+  Gray: [[0,0,0],[255,255,255]],
+  Ice: [[5,10,40],[30,70,160],[80,170,230],[200,240,255],[255,255,255]],
+};
+function lut(stops){
+  const out = new Uint8ClampedArray(256*3);
+  for(let i=0;i<256;i++){
+    const t=i/255*(stops.length-1), k=Math.min(Math.floor(t),stops.length-2), f=t-k;
+    for(let c=0;c<3;c++) out[i*3+c]=stops[k][c]+(stops[k+1][c]-stops[k][c])*f;
+  }
+  return out;
+}
+const LUTS = Object.fromEntries(Object.entries(RAMPS).map(([k,v])=>[k,lut(v)]));
+
+// ---------- effects ----------
+const state = { fx:'Turbo', fog:0.7, fogColor:'#aab4c8', focus:0.75, blur:7, strength:0.06, invert:false };
+const EFFECTS = ['Turbo','Inferno','Gray','Ice','Fog','Focus blur','3D parallax'];
+const fxBox = $('fx');
+for(const name of EFFECTS){
+  const b=document.createElement('button'); b.textContent=name; b.onclick=()=>{state.fx=name;refreshFx();}; fxBox.append(b);
+}
+function slider(label,key,min,max,step){
+  return `<label>${label}<input type="range" min="${min}" max="${max}" step="${step}" value="${state[key]}" data-k="${key}"></label>`;
+}
+function refreshFx(){
+  [...fxBox.children].forEach(b=>b.classList.toggle('on',b.textContent===state.fx));
+  $('fxtag').textContent = state.fx;
+  let h='';
+  if(LUTS[state.fx]) h+=`<label><input type="checkbox" data-k="invert" ${state.invert?'checked':''}> Flip near/far</label>`;
+  if(state.fx==='Fog') h+=slider('Fog amount','fog',0,1,0.01)+`<label>Colour<input type="color" data-k="fogColor" value="${state.fogColor}"></label>`;
+  if(state.fx==='Focus blur') h+=slider('Blur','blur',2,16,1)+`<span class="hint">Tap the picture to choose what stays sharp.</span>`;
+  if(state.fx==='3D parallax') h+=slider('Depth','strength',0.01,0.15,0.005)+`<span class="hint">Move your mouse or finger over the picture.</span>`;
+  $('opts').innerHTML=h;
+  $('opts').querySelectorAll('[data-k]').forEach(el=>el.oninput=()=>{
+    const k=el.dataset.k; state[k]= el.type==='checkbox'?el.checked : el.type==='color'?el.value : parseFloat(el.value);
+  });
+}
+refreshFx();
+
+// ---------- canvases ----------
+const orig=$('orig'), out=$('out'), octx=orig.getContext('2d',{willReadFrequently:true}), xctx=out.getContext('2d',{willReadFrequently:true});
+const blurC=document.createElement('canvas'), bctx=blurC.getContext('2d',{willReadFrequently:true});
+let W=0,H=0, depth=null, hasDepth=false, srcData=null, blurData=null;
+const pointer={x:0.5,y:0.5,active:false};
+function sizeTo(vw,vh,maxSide){
+  const s=maxSide/Math.max(vw,vh); const w=Math.round(vw*Math.min(s,1)/2)*2, h=Math.round(vh*Math.min(s,1)/2)*2;
+  if(w!==W||h!==H){ W=w;H=h; orig.width=out.width=blurC.width=W; orig.height=out.height=blurC.height=H; depth=new Float32Array(W*H); hasDepth=false; }
+}
+out.addEventListener('pointermove',e=>{const r=out.getBoundingClientRect();pointer.x=(e.clientX-r.left)/r.width;pointer.y=(e.clientY-r.top)/r.height;pointer.active=true;});
+out.addEventListener('pointerleave',()=>pointer.active=false);
+out.addEventListener('pointerdown',e=>{
+  const r=out.getBoundingClientRect(); const x=Math.min(W-1,Math.max(0,Math.floor((e.clientX-r.left)/r.width*W))), y=Math.min(H-1,Math.max(0,Math.floor((e.clientY-r.top)/r.height*H)));
+  if(hasDepth && state.fx==='Focus blur'){state.focus=depth[y*W+x];}
+});
+
+// ---------- render one result into ctx from current src + depth ----------
+function renderFx(ctx, srcCtx, t, px, py){
+  const img=ctx.createImageData(W,H), o=img.data, N=W*H;
+  const L=LUTS[state.fx];
+  if(L){
+    for(let i=0;i<N;i++){ let d=depth[i]; if(state.invert) d=1-d; const v=(d*255)|0; o[i*4]=L[v*3];o[i*4+1]=L[v*3+1];o[i*4+2]=L[v*3+2];o[i*4+3]=255; }
+  } else if(state.fx==='Fog'){
+    const s=srcCtx.getImageData(0,0,W,H).data; const c=parseInt(state.fogColor.slice(1),16), fr=c>>16, fg=(c>>8)&255, fb=c&255;
+    for(let i=0;i<N;i++){ const f=Math.min(1,Math.max(0,(1-depth[i])*1.35-0.05))*state.fog; const j=i*4;
+      o[j]=s[j]*(1-f)+fr*f;o[j+1]=s[j+1]*(1-f)+fg*f;o[j+2]=s[j+2]*(1-f)+fb*f;o[j+3]=255; }
+  } else if(state.fx==='Focus blur'){
+    bctx.filter=`blur(${state.blur}px)`; bctx.drawImage(orig,0,0); bctx.filter='none';
+    const s=srcCtx.getImageData(0,0,W,H).data, b=bctx.getImageData(0,0,W,H).data;
+    for(let i=0;i<N;i++){ const f=Math.min(1,Math.abs(depth[i]-state.focus)*3.2); const j=i*4;
+      o[j]=s[j]*(1-f)+b[j]*f;o[j+1]=s[j+1]*(1-f)+b[j+1]*f;o[j+2]=s[j+2]*(1-f)+b[j+2]*f;o[j+3]=255; }
+  } else if(state.fx==='3D parallax'){
+    const s=srcCtx.getImageData(0,0,W,H).data;
+    let ax,ay; if(px==null){ax=Math.sin(t/900)*0.9;ay=Math.cos(t/1300)*0.45;} else {ax=(px-0.5)*2;ay=(py-0.5)*2;}
+    const sx=ax*state.strength*W, sy=ay*state.strength*H;
+    for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+      const i=y*W+x, k=depth[i]-0.5;
+      let xx=Math.round(x+k*sx), yy=Math.round(y+k*sy);
+      xx=xx<0?0:xx>=W?W-1:xx; yy=yy<0?0:yy>=H?H-1:yy;
+      const j=i*4, m=(yy*W+xx)*4; o[j]=s[m];o[j+1]=s[m+1];o[j+2]=s[m+2];o[j+3]=255;
+    }
+  }
+  ctx.putImageData(img,0,0);
+}
+
+// ---------- model ----------
+let depther=null, device='wasm';
+async function loadModel(){
+  if(depther) return depther;
+  bar.style.display='block'; say('Loading the depth model...');
+  const hasGPU = !!navigator.gpu && await navigator.gpu.requestAdapter().then(a=>!!a).catch(()=>false);
+  const progress = p=>{ if(p.status==='progress'&&p.total){barfill.style.width=(p.loaded/p.total*100)+'%';} };
+  const tryLoad=async(dev,dt)=>pipeline('depth-estimation','onnx-community/depth-anything-v2-small',{device:dev,dtype:dt,progress_callback:progress});
+  try{
+    if(hasGPU){ depther=await tryLoad('webgpu','fp16'); device='webgpu'; }
+    else throw 0;
+  }catch(e){
+    depther=await tryLoad('wasm','q8'); device='wasm';
+  }
+  bar.style.display='none';
+  return depther;
+}
+
+async function estimate(canvasEl){
+  const img = RawImage.fromCanvas(canvasEl);
+  const res = await depther(img);
+  const d = res.depth; // RawImage grayscale 0..255
+  const data = d.data;
+  if(d.width!==W||d.height!==H){ /* resize if needed */ 
+    const tmp=document.createElement('canvas'); tmp.width=d.width;tmp.height=d.height;
+  }
+  return data;
+}
+function blendDepth(raw, alpha){
+  for(let i=0;i<W*H;i++){ const v=raw[i]/255; depth[i]= hasDepth ? depth[i]*(1-alpha)+v*alpha : v; }
+  hasDepth=true;
+}
+
+// ---------- sources ----------
+const video=document.createElement('video'); video.playsInline=true; video.muted=true; video.loop=true;
+let doneUntil=0, mode=null, running=false, stream=null, fileURL=null, raf=0, exporting=false, fpsEMA=0;
+
+function show(){ $('empty1').hidden=$('empty2').hidden=true; orig.hidden=out.hidden=false; $('stop').disabled=false; }
+function stop(){
+  running=false; cancelAnimationFrame(raf);
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+  video.pause(); $('stop').disabled=true; if(mode) say('Stopped. Pick another video or use the camera.');
+}
+$('stop').onclick=stop;
+
+async function startMode(m){
+  stop(); mode=m; exporting=false;
+  await loadModel();
+  video.srcObject=null;
+  if(m==='cam'){
+    try{ stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280}},audio:false}); }
+    catch(e){ say('Camera blocked or not found. Allow camera access, or upload a video instead.'); return; }
+    video.srcObject=stream; video.loop=false;
+  } else { video.src=fileURL; video.loop=true; }
+  await video.play();
+  show(); running=true; hasDepth=false; loopInfer(); loopRender();
+  $('dlpng').disabled=false; $('dlvid').disabled = !(m==='file' && Muxer && window.VideoEncoder);
+  $('vidhint').textContent = m==='file' ? (Muxer&&window.VideoEncoder?'Video export uses the effect and settings you pick.':'Video export is not supported in this browser. Image download works.') : 'Video export works with an uploaded video. The camera can save images.';
+}
+$('cam').onclick=()=>startMode('cam');
+$('file').onchange=e=>{ const f=e.target.files[0]; if(!f) return; if(fileURL) URL.revokeObjectURL(fileURL); fileURL=URL.createObjectURL(f); startMode('file'); e.target.value=''; };
+$('quality').onchange=()=>{ if(running||video.readyState>1) sizeFrame(); };
+
+function sizeFrame(){ sizeTo(video.videoWidth||640, video.videoHeight||360, parseInt($('quality').value)); }
+
+async function loopInfer(){
+  while(running){
+    if(exporting){ await new Promise(r=>setTimeout(r,100)); continue; }
+    if(video.readyState<2){ await new Promise(r=>setTimeout(r,50)); continue; }
+    sizeFrame();
+    octx.drawImage(video,0,0,W,H);
+    const t0=performance.now();
+    try{ const raw=await estimate(orig); blendDepth(raw, mode==='cam'?0.7:0.8); }catch(e){ say('Error: '+(e.message||e)); running=false; break; }
+    const dt=performance.now()-t0; fpsEMA = fpsEMA? fpsEMA*0.8+(1000/dt)*0.2 : 1000/dt;
+    if(Date.now()>doneUntil) say(`Live on ${device==='webgpu'?'GPU':'CPU'} at ${fpsEMA.toFixed(1)} frames/sec, ${W}x${H}.`);
+    await new Promise(r=>setTimeout(r,0));
+  }
+}
+function loopRender(){
+  if(!running) return;
+  if(!exporting){
+    if(W){ if(video.readyState>=2 && !hasDepth) octx.drawImage(video,0,0,W,H);
+      if(hasDepth) renderFx(xctx, octx, performance.now(), pointer.active?pointer.x:null, pointer.y); }
+    raf=requestAnimationFrame(loopRender);
+  } else raf=requestAnimationFrame(loopRender);
+}
+
+// ---------- downloads ----------
+function save(blob,name){ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),4000); }
+$('dlpng').onclick=()=>{ if(!hasDepth) return; out.toBlob(b=>save(b,`depth-${state.fx.replace(/\W+/g,'-').toLowerCase()}.png`),'image/png'); };
+
+$('dlvid').onclick=async()=>{
+  if(mode!=='file'||!Muxer||exporting) return;
+  exporting=true; $('dlvid').disabled=true; bar.style.display='block'; barfill.style.width='0%';
+  video.pause(); const dur=video.duration, fps=Math.min(15, 30), total=Math.max(1,Math.floor(dur*fps));
+  const ew=W-(W%2), eh=H-(H%2);
+  const target=new ArrayBufferTarget();
+  const muxer=new Muxer({target,video:{codec:'avc',width:ew,height:eh},fastStart:'in-memory'});
+  const enc=new VideoEncoder({output:(c,m)=>muxer.addVideoChunk(c,m),error:e=>say('Encode error: '+e.message)});
+  enc.configure({codec:'avc1.42E01F',width:ew,height:eh,bitrate:3_000_000,framerate:fps});
+  const prevDepth=hasDepth; hasDepth=false;
+  try{
+    for(let n=0;n<total;n++){
+      const t=Math.min(n/fps,dur-0.01);
+      await new Promise(res=>{ const f=()=>{video.removeEventListener('seeked',f);res();}; video.addEventListener('seeked',f); video.currentTime=t; });
+      octx.drawImage(video,0,0,W,H);
+      const raw=await estimate(orig); blendDepth(raw, 0.8);
+      renderFx(xctx, octx, t*1000, null, 0.5);
+      const frame=new VideoFrame(out,{timestamp:Math.round(n*1e6/fps),duration:Math.round(1e6/fps)});
+      enc.encode(frame,{keyFrame:n%30===0}); frame.close();
+      barfill.style.width=((n+1)/total*100)+'%'; say(`Exporting video: frame ${n+1} of ${total}`);
+      if(enc.encodeQueueSize>8) await enc.flush();
+    }
+    await enc.flush(); muxer.finalize();
+    save(new Blob([target.buffer],{type:'video/mp4'}),`depth-${state.fx.replace(/\W+/g,'-').toLowerCase()}.mp4`);
+    say('Done. Your video was downloaded.'); doneUntil=Date.now()+6000;
+  }catch(e){ say('Export failed: '+(e.message||e)); }
+  bar.style.display='none'; exporting=false; hasDepth=prevDepth; $('dlvid').disabled=false;
+  if(running) video.play();
+};
+
+// test hook
+window.__depth={state, get ready(){return hasDepth;}, get fps(){return fpsEMA;}, get device(){return device;}};
+loadModel().then(()=>say('Model ready. Upload a video or use the camera.')).catch(e=>say('Could not load the model: '+(e.message||e)));
+</script>
+</body>
+</html>
