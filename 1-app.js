@@ -46,8 +46,8 @@ function lut(stops) {
 const LUTS = Object.fromEntries(Object.entries(RAMPS).map(([k, v]) => [k, lut(v)]));
 
 // ---------- effect settings / UI ----------
-const state = { fx: 'Turbo', fog: 0.7, fogColor: '#aab4c8', focus: 0.75, blur: 7, strength: 0.06, invert: false };
-const EFFECTS = ['Turbo', 'Inferno', 'Gray', 'Ice', 'Fog', 'Focus blur', '3D parallax'];
+const state = { fx: 'Turbo', fog: 0.7, fogColor: '#aab4c8', focus: 0.75, blur: 7, strength: 0.06, invert: false, d3: 1.0, points: false };
+const EFFECTS = ['Turbo', 'Inferno', 'Gray', 'Ice', 'Fog', 'Focus blur', '3D parallax', '3D view'];
 let dirty = true;
 const fxBox = $('fx');
 for (const name of EFFECTS) {
@@ -64,14 +64,16 @@ function refreshFx() {
   if (state.fx === 'Fog') h += slider('Fog amount', 'fog', 0, 1, 0.01) + `<label>Colour<input type="color" data-k="fogColor" value="${state.fogColor}"></label>`;
   if (state.fx === 'Focus blur') h += slider('Blur', 'blur', 2, 16, 1) + `<span class="hint">Tap the picture to choose what stays sharp.</span>`;
   if (state.fx === '3D parallax') h += slider('Depth', 'strength', 0.01, 0.15, 0.005) + `<span class="hint">Move your mouse or finger over the picture.</span>`;
+  if (state.fx === '3D view') h += slider('Depth', 'd3', 0.3, 2, 0.05) + `<label><input type="checkbox" data-k="points" ${state.points ? 'checked' : ''}> Points</label><span class="hint">Drag to turn it. Scroll or pinch to zoom.</span>`;
   $('opts').innerHTML = h;
+  glc.style.display = state.fx === '3D view' ? 'block' : 'none';
   $('opts').querySelectorAll('[data-k]').forEach(el => el.oninput = () => {
     const k = el.dataset.k;
     state[k] = el.type === 'checkbox' ? el.checked : el.type === 'color' ? el.value : parseFloat(el.value);
     dirty = true;
   });
 }
-refreshFx();
+// refreshFx moved
 
 // ---------- sizes ----------
 const orig = $('orig'), out = $('out');
@@ -85,12 +87,15 @@ let PW = 0, PH = 0;            // model input size
 const pointer = { x: .5, y: .5, active: false };
 
 const QUALITY = [
-  { side: 252, afps: 8 },
-  { side: 336, afps: 10 },
-  { side: 518, afps: 12 },
+  { side: 252, afps: 8, key: 'small' },
+  { side: 336, afps: 10, key: 'small' },
+  { side: 518, afps: 6, key: 'base' },
 ];
+const gpuOK = !!navigator.gpu && await navigator.gpu.requestAdapter().then(a => !!a).catch(() => false);
+let camClamp = false;
+const qi = () => { let i = parseInt($('quality').value); if (camClamp && !gpuOK) i = Math.min(i, 1); return i; };
 function setSizes(vw, vh) {
-  const q = QUALITY[parseInt($('quality').value)];
+  const q = QUALITY[qi()];
   const s = q.side / Math.max(vw, vh);
   PW = Math.max(14, Math.round(vw * s / 14) * 14);
   PH = Math.max(14, Math.round(vh * s / 14) * 14);
@@ -183,6 +188,75 @@ function refine(depth, srcFull) {
   }
 }
 
+// ---------- real 3D view (WebGL2): the picture is lifted into a surface or point cloud ----------
+const glc = document.createElement('canvas');
+glc.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;display:none;touch-action:none;cursor:grab';
+out.parentElement.append(glc);
+const gl = glc.getContext('webgl2', { preserveDrawingBuffer: true, antialias: true });
+refreshFx();
+const view = { yaw: 0, pitch: 0.05, zoom: 1.0, last: 0 };
+let glp = null, glTexD, glTexT, glVao, glIdx = 0, glPts = 0, glGrid = '';
+function glInit() {
+  if (!gl || glp) return;
+  const vs = `#version 300 es
+  in vec2 a; uniform sampler2D uD; uniform float uYaw, uPitch, uZoom, uAsp, uScale, uPt;
+  out vec2 vUv; out float vD;
+  void main(){ vUv = a; float d = textureLod(uD, a, 0.0).r; vD = d;
+    vec3 p = vec3((a.x-.5)*2.0*uAsp, (.5-a.y)*2.0, (d-.5)*uScale);
+    float cy=cos(uYaw), sy=sin(uYaw), cp=cos(uPitch), sp=sin(uPitch);
+    vec3 q = vec3(cy*p.x+sy*p.z, p.y, -sy*p.x+cy*p.z);
+    q = vec3(q.x, cp*q.y - sp*q.z, sp*q.y + cp*q.z);
+    float k = 1.0/(1.0 - q.z*0.28);
+    gl_Position = vec4(q.x*k*uZoom/uAsp, q.y*k*uZoom, -q.z*0.4, 1.0);
+    gl_PointSize = uPt * k * uZoom; }`;
+  const fs = `#version 300 es
+  precision highp float; in vec2 vUv; in float vD; uniform sampler2D uT; uniform float uPt; out vec4 o;
+  void main(){ if(uPt < 0.5 && fwidth(vD) > 0.035) discard; o = vec4(texture(uT, vUv).rgb, 1.0); }`;
+  const sh = (t, src) => { const x = gl.createShader(t); gl.shaderSource(x, src); gl.compileShader(x); if (!gl.getShaderParameter(x, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(x)); return x; };
+  glp = gl.createProgram(); gl.attachShader(glp, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(glp, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(glp);
+  glTexD = gl.createTexture(); glTexT = gl.createTexture();
+  for (const t of [glTexD, glTexT]) { gl.bindTexture(gl.TEXTURE_2D, t); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); }
+}
+function glMesh() {
+  const key = DW + 'x' + DH; if (key === glGrid) return; glGrid = key;
+  const gx = 288, gy = Math.max(8, Math.round(gx * DH / DW)), v = new Float32Array((gx + 1) * (gy + 1) * 2);
+  for (let y = 0, k = 0; y <= gy; y++) for (let x = 0; x <= gx; x++) { v[k++] = x / gx; v[k++] = y / gy; }
+  const idx = new Uint32Array(gx * gy * 6); let m = 0;
+  for (let y = 0; y < gy; y++) for (let x = 0; x < gx; x++) { const a = y * (gx + 1) + x, b = a + 1, c = a + gx + 1, d = c + 1; idx[m++] = a; idx[m++] = b; idx[m++] = c; idx[m++] = b; idx[m++] = d; idx[m++] = c; }
+  glVao = gl.createVertexArray(); gl.bindVertexArray(glVao);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, v, gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(glp, 'a'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  glIdx = idx.length; glPts = v.length / 2;
+}
+let d8 = null;
+function renderGL(time) {
+  glInit(); if (!glp) return; glMesh();
+  if (glc.width !== DW || glc.height !== DH) { glc.width = DW; glc.height = DH; }
+  const n = DW * DH; if (!d8 || d8.length !== n) d8 = new Uint8Array(n);
+  for (let i = 0; i < n; i++) d8[i] = depthD[i] * 255 + .5;
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, glTexD); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, DW, DH, 0, gl.RED, gl.UNSIGNED_BYTE, d8);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, glTexT); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, orig);
+  gl.viewport(0, 0, DW, DH); gl.clearColor(.05, .055, .075, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
+  gl.useProgram(glp);
+  const idle = performance.now() - view.last > 3000;
+  const yaw = idle ? Math.sin(time / 1600) * 0.38 : view.yaw, pitch = idle ? 0.05 + Math.sin(time / 2300) * 0.08 : view.pitch;
+  gl.uniform1i(gl.getUniformLocation(glp, 'uD'), 0); gl.uniform1i(gl.getUniformLocation(glp, 'uT'), 1);
+  gl.uniform1f(gl.getUniformLocation(glp, 'uYaw'), yaw); gl.uniform1f(gl.getUniformLocation(glp, 'uPitch'), pitch);
+  gl.uniform1f(gl.getUniformLocation(glp, 'uZoom'), view.zoom * 1.2); gl.uniform1f(gl.getUniformLocation(glp, 'uAsp'), DW / DH);
+  gl.uniform1f(gl.getUniformLocation(glp, 'uScale'), state.d3 * 1.1); gl.uniform1f(gl.getUniformLocation(glp, 'uPt'), state.points ? Math.max(2.2, DW / 220) : 0);
+  gl.bindVertexArray(glVao);
+  if (state.points) gl.drawArrays(gl.POINTS, 0, glPts); else gl.drawElements(gl.TRIANGLES, glIdx, gl.UNSIGNED_INT, 0);
+}
+{ let drag = null;
+  glc.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, yaw: view.last && performance.now() - view.last < 3000 ? view.yaw : 0, pitch: view.pitch }; glc.setPointerCapture(e.pointerId); glc.style.cursor = 'grabbing'; });
+  glc.addEventListener('pointermove', e => { if (!drag) return; view.yaw = drag.yaw + (e.clientX - drag.x) / 200; view.pitch = Math.max(-1, Math.min(1, drag.pitch + (e.clientY - drag.y) / 200)); view.last = performance.now(); dirty = true; });
+  glc.addEventListener('pointerup', () => { drag = null; glc.style.cursor = 'grab'; });
+  glc.addEventListener('wheel', e => { e.preventDefault(); view.zoom = Math.max(.5, Math.min(3, view.zoom * (e.deltaY < 0 ? 1.08 : .93))); view.last = performance.now(); dirty = true; }, { passive: false });
+  let pinch = 0; glc.addEventListener('touchmove', e => { if (e.touches.length === 2) { const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY); if (pinch) view.zoom = Math.max(.5, Math.min(3, view.zoom * d / pinch)); pinch = d; view.last = performance.now(); dirty = true; } }, { passive: true });
+  glc.addEventListener('touchend', () => { pinch = 0; });
+}
 // ---------- render ----------
 let depthD = null;            // Float32 display-res depth
 function renderFx(ctx, srcData, t, px, py) {
@@ -216,7 +290,8 @@ function drawResult(a, b, t, time) {
   upsample(a, b, t, depthD, DW, DH, PW);
   const srcData = octx.getImageData(0, 0, DW, DH).data;
   if (useGuided) refine(depthD, srcData);
-  renderFx(xctx, srcData, time ?? performance.now(), pointer.active ? pointer.x : null, pointer.y);
+  if (state.fx === '3D view') renderGL(time ?? performance.now());
+  else renderFx(xctx, srcData, time ?? performance.now(), pointer.active ? pointer.x : null, pointer.y);
 }
 out.addEventListener('pointermove', e => { const r = out.getBoundingClientRect(); pointer.x = (e.clientX - r.left) / r.width; pointer.y = (e.clientY - r.top) / r.height; pointer.active = true; if (state.fx === '3D parallax') dirty = true; });
 out.addEventListener('pointerleave', () => { pointer.active = false; });
@@ -227,18 +302,23 @@ out.addEventListener('pointerdown', e => {
 });
 
 // ---------- model ----------
-let model = null, device = 'wasm';
-async function loadModel() {
-  if (model) return model;
-  bar.style.display = 'block'; barfill.style.width = '0%'; say('Loading the depth model (first time only, about 30 MB)...');
-  const hasGPU = !!navigator.gpu && await navigator.gpu.requestAdapter().then(a => !!a).catch(() => false);
+const models = {}; let model = null, device = gpuOK ? 'webgpu' : 'wasm';
+const MODELS = {
+  small: { id: 'onnx-community/depth-anything-v2-small', gpu: 'fp16', cpu: 'q8', mb: 30 },
+  base: { id: 'onnx-community/depth-anything-v2-base', gpu: 'fp16', cpu: 'q4', mb: gpuOK ? 195 : 100 },
+};
+async function loadModel(key = QUALITY[qi()].key) {
+  if (models[key]) { model = models[key]; return model; }
+  const M = MODELS[key];
+  bar.style.display = 'block'; barfill.style.width = '0%'; say(`Loading the ${key === 'base' ? 'Best' : 'standard'} depth model (first time only, about ${M.mb} MB)...`);
   const progress = p => { if (p.status === 'progress' && p.total) barfill.style.width = (p.loaded / p.total * 100) + '%'; };
-  const id = 'onnx-community/depth-anything-v2-small';
-  const attempt = (dev, dt) => AutoModelForDepthEstimation.from_pretrained(id, { device: dev, dtype: dt, progress_callback: progress });
-  try { if (!hasGPU) throw 0; model = await attempt('webgpu', 'fp16'); device = 'webgpu'; }
-  catch (e) { model = await attempt('wasm', 'q8'); device = 'wasm'; }
+  const attempt = (dev, dt) => AutoModelForDepthEstimation.from_pretrained(M.id, { device: dev, dtype: dt, progress_callback: progress });
+  let m;
+  try { if (!gpuOK) throw 0; m = await attempt('webgpu', M.gpu); device = 'webgpu'; }
+  catch (e) { m = await attempt('wasm', M.cpu); device = 'wasm'; }
+  models[key] = m; model = m;
   bar.style.display = 'none';
-  return model;
+  return m;
 }
 const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
 let inBuf = null;
@@ -274,7 +354,7 @@ function quant(raw, lo, hi, dst) {
 const video = document.createElement('video'); video.playsInline = true; video.muted = true;
 let mode = null, running = false, busy = false, stream = null, fileURL = null, token = 0;
 let cache = null;     // {frames:[Uint8Array], gray:[Uint8Array], n, afps, dur}
-window.__depth = { state, get cache() { return cache; }, get device() { return device; }, get sizes() { return { DW, DH, PW, PH }; }, timings: {} };
+window.__depth = { state, view, gl: !!gl, get cache() { return cache; }, get device() { return device; }, get sizes() { return { DW, DH, PW, PH }; }, timings: {} };
 
 function show() { $('empty1').hidden = $('empty2').hidden = true; orig.hidden = out.hidden = false; }
 function stopAll() {
@@ -287,14 +367,14 @@ $('stop').onclick = () => { stopAll(); say('Stopped. Pick another video or use t
 
 // --- upload: analyse once, cache, play ---
 async function startFile() {
-  stopAll(); mode = 'file'; const my = token; cache = null;
+  stopAll(); mode = 'file'; const my = token; cache = null; camClamp = false;
   await loadModel(); if (my !== token) return;
   video.srcObject = null; video.src = fileURL; video.loop = false;
   await new Promise(r => { video.onloadedmetadata = r; video.load(); });
   const dur = video.duration; if (!isFinite(dur) || dur <= 0) { say('Could not read that video.'); return; }
   setSizes(video.videoWidth, video.videoHeight); show();
-  const q = QUALITY[parseInt($('quality').value)];
-  const afps = Math.min(q.afps, 900 / dur), n = Math.max(2, Math.floor(dur * afps));
+  const q = QUALITY[qi()];
+  const afps = Math.min(gpuOK ? q.afps * 1.5 : q.afps, 900 / dur), n = Math.max(2, Math.floor(dur * afps));
   const frames = [], grays = [], raws = [], los = [], his = [];
   $('stop').disabled = false; $('dlpng').disabled = true; $('dlvid').disabled = true;
   bar.style.display = 'block'; barfill.style.width = '0%';
@@ -347,7 +427,7 @@ function playLoop() {
   if (!running || mode !== 'play') return;
   const t = video.currentTime, fi = Math.min(cache.n - 1, t * cache.afps), i0 = Math.floor(fi), i1 = Math.min(cache.n - 1, i0 + 1), f = fi - i0;
   const key = `${i0}:${f.toFixed(2)}:${video.paused}`;
-  const par = state.fx === '3D parallax';
+  const par = state.fx === '3D parallax' || state.fx === '3D view';
   if (dirty || key !== lastKey || par) {
     const t0 = performance.now();
     octx.drawImage(video, 0, 0, DW, DH);
@@ -367,7 +447,7 @@ $('play').onclick = () => { if (video.paused) { video.play(); $('play').textCont
 
 // --- live camera: separate mode ---
 async function startCam() {
-  stopAll(); mode = 'cam'; const my = token; cache = null;
+  stopAll(); mode = 'cam'; const my = token; cache = null; camClamp = true;
   await loadModel(); if (my !== token) return;
   try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 } }, audio: false }); }
   catch (e) { say('Camera blocked or not found. Allow camera access, or upload a video instead.'); return; }
@@ -412,7 +492,7 @@ $('quality').onchange = () => { if (mode === 'file' || mode === 'play') { if (fi
 
 // ---------- downloads (reuse the cache, never re-run the model) ----------
 function save(blob, name) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); }
-$('dlpng').onclick = () => out.toBlob(b => save(b, `depth-${state.fx.replace(/\W+/g, '-').toLowerCase()}.png`), 'image/png');
+$('dlpng').onclick = () => (state.fx === '3D view' ? glc : out).toBlob(b => save(b, `depth-${state.fx.replace(/\W+/g, '-').toLowerCase()}.png`), 'image/png');
 $('dlvid').onclick = async () => {
   if (mode !== 'play' || !cache || !Muxer) return;
   running = false; video.pause(); $('dlvid').disabled = true; bar.style.display = 'block'; barfill.style.width = '0%';
@@ -427,7 +507,7 @@ $('dlvid').onclick = async () => {
       await new Promise(res => { const f = () => { video.removeEventListener('seeked', f); res(); }; video.addEventListener('seeked', f); video.currentTime = t; });
       octx.drawImage(video, 0, 0, DW, DH);
       drawResult(cache.frames[i0], cache.frames[i1], fi - i0, t * 1000);
-      const fr = new VideoFrame(out, { timestamp: Math.round(k * 1e6 / efps), duration: Math.round(1e6 / efps) });
+      const fr = new VideoFrame(state.fx === '3D view' ? glc : out, { timestamp: Math.round(k * 1e6 / efps), duration: Math.round(1e6 / efps) });
       enc.encode(fr, { keyFrame: k % 48 === 0 }); fr.close();
       barfill.style.width = ((k + 1) / total * 100) + '%'; say(`Saving video: frame ${k + 1} of ${total}`);
       if (enc.encodeQueueSize > 6) await enc.flush();
@@ -443,4 +523,4 @@ $('dlvid').onclick = async () => {
 window.__depth.setGuided = v => { useGuided = v; dirty = true; };
 window.__depth.seek = t => { video.pause(); video.currentTime = t; dirty = true; };
 window.__depth.setG = (e, r) => { GEPS = e; GR = r; dirty = true; };
-loadModel().then(() => say('Ready. Upload a video or use the live camera.')).catch(e => say('Could not load the model: ' + (e.message || e)));
+loadModel('small').then(() => say('Ready. Upload a video or use the live camera.')).catch(e => say('Could not load the model: ' + (e.message || e)));
